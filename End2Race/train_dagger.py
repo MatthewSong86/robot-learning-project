@@ -21,41 +21,24 @@ from utils import load_raceline_with_speed, calculate_metrics
 
 
 def parse_arguments():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='DAgger training for End2Race speed-conditioned model')
 
-    # Data and model paths
-    parser.add_argument("--data_path", type=str, default="Dataset_Austin/success",
-                        help="Path to initial BC demonstration data")
-    parser.add_argument("--model_path", type=str, default="end2race_dagger2.pth",
-                        help="Path to save/load model weights")
-    parser.add_argument("--dagger_data_dir", type=str, default="DAgger_Data",
-                        help="Directory to store aggregated DAgger rollout CSVs")
+    parser.add_argument("--data_path", type=str, default="Dataset_Austin/success")
+    parser.add_argument("--model_path", type=str, default="end2race_dagger7.pth")
+    parser.add_argument("--dagger_data_dir", type=str, default="DAgger_Data")
 
-    # Model configuration
     parser.add_argument("--hidden_scale", type=int, default=4)
     parser.add_argument("--mask_prob", type=float, default=0.1)
 
-    # DAgger configuration
-    parser.add_argument("--dagger_iterations", type=int, default=10,
-                        help="Number of DAgger outer iterations")
-    parser.add_argument("--rollout_steps", type=int, default=30000,
-                        help="Max env steps per DAgger rollout")
+    parser.add_argument("--dagger_iterations", type=int, default=10)
+    parser.add_argument("--rollout_steps", type=int, default=30000)
     parser.add_argument("--map_name", type=str, default="Austin")
-    parser.add_argument("--raceline", type=str, default="raceline1",
-                        help="Raceline file name (without .csv) for the expert planner")
-    parser.add_argument("--beta_start", type=float, default=1.0,
-                        help="Initial mixing coefficient (1.0 = pure expert)")
-    parser.add_argument("--beta_decay", type=float, default=0.5,
-                        help="Multiplicative decay applied to beta each DAgger iteration")
-    parser.add_argument("--beta_min", type=float, default=0.0,
-                        help="Floor for beta (pure student below this)")
+    parser.add_argument("--raceline", type=str, default="raceline1")
+    parser.add_argument("--beta_start", type=float, default=1.0)
 
-    # Training configuration
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=0.001)
-    parser.add_argument("--num_epochs", type=int, default=100,
-                        help="Supervised epochs per DAgger iteration")
+    parser.add_argument("--num_epochs", type=int, default=25)
 
     return parser.parse_args()
 
@@ -151,9 +134,6 @@ class DAggerEpisodeDataset(Dataset):
         return lidar_tensor, speed_tensor, action_tensor
 
 
-# ---------------------------------------------------------------------------
-# DAgger rollout with real lattice planner expert
-# ---------------------------------------------------------------------------
 
 def collect_dagger_rollout(
     model,
@@ -166,26 +146,10 @@ def collect_dagger_rollout(
     iteration,
     raceline='raceline1',
     config_path='latticeplanner/lattice_config.yaml',
+    max_sequences_per_rollout=None,
 ):
-    """
-    Roll out the student in the real environment, labelled by the real lattice
-    planner expert (identical planner setup to run_lattice_planner.py).
-
-    At each step:
-      - expert produces (steer, speed) via planner.tracker.plan  → always recorded as label
-      - with probability beta  → expert action is executed
-      - with probability 1-beta → student action is executed
-
-    All (lidar, prev_speed, expert_action) tuples are saved to CSV and also
-    returned as pre-built sequence dicts ready for DAggerEpisodeDataset.
-
-    Returns:
-        sequences (List[dict])  –  list of {'lidar', 'speed', 'action'} windows
-        csv_path  (str)         –  path to the saved CSV for this rollout
-    """
     raceline_file = f'{map_name}_raceline.csv'
 
-    # ── Real expert planner (identical setup to run_lattice_planner.py) ───────
     config = load_config(config_path)
     map_directory, map_path = get_map_paths(map_name)
     raceline_path = os.path.join(map_directory, f"{raceline}.csv")
@@ -204,21 +168,25 @@ def collect_dagger_rollout(
     )
 
     start_pose, initial_speed, waypoints = load_raceline_with_speed(map_name, raceline_file, start_idx=0)
+
+    # Reset env ONCE before the main loop
     obs, _, done, _ = env.reset(poses=start_pose)
 
-    hidden_size  = model.gru.hidden_size
+    hidden_size = model.gru.hidden_size
     hidden_state = torch.zeros((1, 1, hidden_size), device=device)
-    prev_speed   = initial_speed * 0.9
     num_features = 360
 
-    lidar_buf  = []   # (360,)  float32
-    speed_buf  = []   # scalar  float32  – prev_speed fed to model
-    action_buf = []   # (2,)    float32  – expert label [steer, desired_speed]
+    prev_commanded_speed = initial_speed
+
+    lidar_buf = []
+    speed_buf = []
+    action_buf = []
 
     step = 0
     sim_time = 0.0
     sample_interval = 0.1
     next_record_time = sample_interval
+    collision_occurred = False
 
     while not done and step < rollout_steps:
         no_opp = np.zeros((1, 4), dtype=np.float64)
@@ -230,7 +198,22 @@ def collect_dagger_rollout(
 
         tracker_count = 0
         while not done and tracker_count < tracker_steps and step < rollout_steps:
-            # ── Expert label from tracker ─────────────────────────────────────
+            current_vel = obs['linear_vels_x'][0]
+
+            # Guard: skip tracker call until car has enough velocity for pure pursuit math
+            if current_vel < 0.1:
+                obs, timestep, done, _ = env.step(np.array([[0.0, initial_speed]]))
+                sim_time += timestep
+                prev_commanded_speed = initial_speed
+                step += 1
+                tracker_count += 1
+                continue
+
+            lidar = np.array(obs["scans"][0]).flatten()
+            if len(lidar) > num_features:
+                indices = np.linspace(0, len(lidar) - 1, num_features, dtype=int)
+                lidar = lidar[indices]
+
             exp_steer, exp_speed = planner.tracker.plan(
                 obs['poses_x'][0], obs['poses_y'][0], obs['poses_theta'][0],
                 obs['linear_vels_x'][0], best_traj,
@@ -238,40 +221,37 @@ def collect_dagger_rollout(
             exp_steer = float(np.clip(exp_steer, -0.52, 0.52))
             exp_speed = float(exp_speed)
 
-            # ── Execute action (beta mixing) ──────────────────────────────────
-            # Student inference only needed when recording or executing student
-            if np.random.random() >= beta:
-                lidar = np.array(obs["scans"][0]).flatten()
-                if len(lidar) > num_features:
-                    indices = np.linspace(0, len(lidar) - 1, num_features, dtype=int)
-                    lidar = lidar[indices]
-                with torch.no_grad():
-                    lidar_t = torch.tensor(lidar, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-                    speed_t = torch.tensor([[[prev_speed]]], dtype=torch.float32, device=device)
-                    action_seq, hidden_state = model(lidar_t, speed_t, hidden_state)
-                    action_t = action_seq[:, -1, :]
-                    exec_steer = float(np.clip(action_t[0, 0].item(), -0.52, 0.52))
-                    exec_speed = float(action_t[0, 1].item())
-            else:
+            # Record BEFORE stepping
+            if sim_time >= next_record_time:
+                lidar_buf.append(lidar.copy())
+                speed_buf.append(float(prev_commanded_speed))
+                action_buf.append([exp_steer, exp_speed])
+                next_record_time += sample_interval
+
+            # Always run student to maintain hidden state
+            with torch.no_grad():
+                lidar_t = torch.tensor(lidar, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+                speed_t = torch.tensor([[[prev_commanded_speed]]], dtype=torch.float32, device=device)
+                action_seq, hidden_state = model(lidar_t, speed_t, hidden_state)
+                action_t = action_seq[:, -1, :]
+                stu_steer = float(np.clip(action_t[0, 0].item(), -0.52, 0.52))
+                stu_speed = float(action_t[0, 1].item())
+
+            # Beta mixing for execution
+            if np.random.random() < beta:
                 exec_steer, exec_speed = exp_steer, exp_speed
+            else:
+                exec_steer, exec_speed = stu_steer, stu_speed
 
             obs, timestep, done, _ = env.step(np.array([[exec_steer, exec_speed]]))
             sim_time += timestep
-            prev_speed = obs['linear_vels_x'][0]
+
+            # Always track expert speed for conditioning (fix for speed underperformance)
+            prev_commanded_speed = exec_speed 
 
             if obs['collisions'][0]:
+                collision_occurred = True
                 done = True
-
-            # ── Record at 10Hz to match BC data collector ─────────────────────
-            while sim_time >= next_record_time:
-                lidar_rec = np.array(obs["scans"][0]).flatten()
-                if len(lidar_rec) > num_features:
-                    indices = np.linspace(0, len(lidar_rec) - 1, num_features, dtype=int)
-                    lidar_rec = lidar_rec[indices]
-                lidar_buf.append(lidar_rec.copy())
-                speed_buf.append(float(prev_speed))
-                action_buf.append([exp_steer, exp_speed])
-                next_record_time += sample_interval
 
             tracker_count += 1
             step += 1
@@ -279,7 +259,14 @@ def collect_dagger_rollout(
     env.close()
     gc.collect()
 
-    # ── Save raw rollout to CSV ───────────────────────────────────────────────
+    # Discard samples near collision
+    if collision_occurred and len(lidar_buf) > 20:
+        discard_samples = min(20, len(lidar_buf) // 4)
+        lidar_buf = lidar_buf[:-discard_samples]
+        speed_buf = speed_buf[:-discard_samples]
+        action_buf = action_buf[:-discard_samples]
+        print(f"  Collision: discarded last {discard_samples} samples")
+
     os.makedirs(dagger_data_dir, exist_ok=True)
     csv_path = os.path.join(dagger_data_dir, f"rollout_iter{iteration:03d}.csv")
 
@@ -288,37 +275,42 @@ def collect_dagger_rollout(
         row = {"time": t}
         for i, v in enumerate(lidar_buf[t]):
             row[f"lidar_{i}"] = v
-        row["steer"]         = action_buf[t][0]
+        row["steer"] = action_buf[t][0]
         row["desired_speed"] = action_buf[t][1]
         rows.append(row)
 
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     print(f"  Rollout saved → {csv_path}  ({len(rows)} steps)")
 
-    # ── Build sequence windows (mirrors SequenceDataset._create_sequences) ────
-    lidar_arr  = np.array(lidar_buf,  dtype=np.float32)
-    speed_arr  = np.array(speed_buf,  dtype=np.float32).reshape(-1, 1)
-    action_arr = np.array(action_buf, dtype=np.float32)
-
-    if len(lidar_arr) < sequence_length + 1:
-        print(f"  Warning: rollout too short ({len(lidar_arr)} steps), skipping sequence creation.")
+    if len(lidar_buf) < sequence_length + 1:
+        print(f"  Warning: rollout too short ({len(lidar_buf)} steps), skipping sequence creation.")
         return [], csv_path
 
-    lidar_valid  = lidar_arr[1:]
+    lidar_arr = np.array(lidar_buf, dtype=np.float32)
+    speed_arr = np.array(speed_buf, dtype=np.float32).reshape(-1, 1)
+    action_arr = np.array(action_buf, dtype=np.float32)
+
+    lidar_valid = lidar_arr[1:]
     action_valid = action_arr[1:]
-    speed_prev   = speed_arr[:-1]   # shape (T-1, 1)
+    speed_prev = speed_arr[:-1]
 
     sequences = []
     num_samples = len(lidar_valid)
     for end_idx in range(sequence_length - 1, num_samples):
         start_idx = end_idx - sequence_length + 1
         sequences.append({
-            'lidar':  lidar_valid[start_idx:end_idx + 1],
-            'speed':  speed_prev[start_idx:end_idx + 1],
+            'lidar': lidar_valid[start_idx:end_idx + 1],
+            'speed': speed_prev[start_idx:end_idx + 1],
             'action': action_valid[start_idx:end_idx + 1],
         })
 
-    print(f"  Created {len(sequences)} sequences from rollout.")
+    if max_sequences_per_rollout is not None and len(sequences) > max_sequences_per_rollout:
+        indices = np.linspace(0, len(sequences) - 1, max_sequences_per_rollout, dtype=int)
+        sequences = [sequences[i] for i in indices]
+        print(f"  Limited to {len(sequences)} sequences")
+    else:
+        print(f"  Created {len(sequences)} sequences from rollout.")
+
     return sequences, csv_path
 
 
@@ -327,15 +319,21 @@ def collect_dagger_rollout(
 # ---------------------------------------------------------------------------
 
 def train(model_path, model, train_loader, criterion, optimizer, scheduler, num_epochs=100):
-    """Supervised training loop (identical contract to train.py)."""
+    """Supervised training loop."""
     best_loss = float("inf")
 
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0.0
 
+        # NEW: speed tracking
+        student_speed_sum = 0.0
+        expert_speed_sum = 0.0
+        speed_count = 0
+
         with tqdm(train_loader, desc=f"  Epoch {epoch + 1}/{num_epochs}") as pbar:
             for lidar_seq, speed_seq, target_actions in pbar:
+
                 optimizer.zero_grad()
 
                 predicted_actions, _ = model(lidar_seq, speed_seq)
@@ -352,21 +350,32 @@ def train(model_path, model, train_loader, criterion, optimizer, scheduler, num_
                 optimizer.step()
 
                 total_loss += loss.item()
+
+                # NEW: accumulate speeds
+                student_speed_sum += predicted_actions_flat[:, 1].detach().mean().item()
+                expert_speed_sum += target_actions_flat[:, 1].detach().mean().item()
+                speed_count += 1
+
                 pbar.set_postfix(loss=loss.item())
 
         avg_loss = total_loss / len(train_loader)
-        print(f"  Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.5f}")
+
+        # NEW: epoch speed stats
+        avg_student_speed = student_speed_sum / speed_count
+        avg_expert_speed = expert_speed_sum / speed_count
+
+        print(f"\n  Epoch {epoch + 1}/{num_epochs}")
+        print(f"  Loss: {avg_loss:.5f}")
+        print(f"  Student speed: {avg_student_speed:.3f}")
+        print(f"  Expert speed:  {avg_expert_speed:.3f}")
 
         scheduler.step(avg_loss)
+
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(), model_path)
             print(f"  New best loss: {best_loss:.5f}. Model saved.")
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = parse_arguments()
@@ -374,7 +383,6 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ── Phase 0: load initial BC dataset ─────────────────────────────────────
     print("\n=== Loading initial demonstration dataset ===")
     bc_dataset = SequenceDataset(
         data_path=args.data_path,
@@ -382,8 +390,8 @@ if __name__ == "__main__":
         device=device,
     )
     sequence_length = bc_dataset.sequence_length
+    bc_dataset_size = len(bc_dataset)
 
-    # ── Build model ───────────────────────────────────────────────────────────
     model = End2Race(mask_prob=args.mask_prob, hidden_scale=args.hidden_scale).to(device)
 
     if args.model_path and os.path.exists(args.model_path):
@@ -391,20 +399,22 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=False))
 
     criterion = nn.MSELoss()
-
-    # Accumulated DAgger sequences across all iterations
     all_dagger_sequences: List[dict] = []
 
-    beta = args.beta_start
-
-    # ── DAgger outer loop ─────────────────────────────────────────────────────
     for dagger_iter in range(args.dagger_iterations):
+        # Linear decay: beta goes from beta_start to 0 at last iteration
+        if args.dagger_iterations > 1:
+            beta = args.beta_start * (1.0 - dagger_iter / (args.dagger_iterations - 1))
+        else:
+            beta = 0.0
+
         print(f"\n{'='*60}")
         print(f"DAgger iteration {dagger_iter + 1}/{args.dagger_iterations}  (beta={beta:.3f})")
         print(f"{'='*60}")
 
-        # ── Step 1: rollout student in the real environment ───────────────────
         print("Rolling out policy in environment…")
+        max_seqs = bc_dataset_size // 2
+
         new_sequences, csv_path = collect_dagger_rollout(
             model=model,
             device=device,
@@ -415,10 +425,10 @@ if __name__ == "__main__":
             dagger_data_dir=args.dagger_data_dir,
             iteration=dagger_iter,
             raceline=args.raceline,
+            max_sequences_per_rollout=max_seqs,
         )
         all_dagger_sequences.extend(new_sequences)
 
-        # ── Step 2: build aggregated dataset (BC data + all DAgger data) ──────
         datasets_to_combine = [bc_dataset]
         if all_dagger_sequences:
             dagger_dataset = DAggerEpisodeDataset(all_dagger_sequences, device=device)
@@ -435,10 +445,9 @@ if __name__ == "__main__":
             **dataloader_kwargs,
         )
 
-        print(f"Aggregated dataset size: {len(combined_dataset)} sequences")
+        print(f"Dataset: BC={bc_dataset_size}, DAgger={len(all_dagger_sequences)}, Total={len(combined_dataset)}")
         print(f"Train batches: {len(train_loader)}")
 
-        # ── Step 3: retrain from current weights on aggregated data ───────────
         optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=10
@@ -454,8 +463,5 @@ if __name__ == "__main__":
             scheduler=scheduler,
             num_epochs=args.num_epochs,
         )
-
-        # ── Step 4: decay beta ────────────────────────────────────────────────
-        beta = max(args.beta_min, beta * args.beta_decay)
 
     print("\nDAgger training completed successfully!")

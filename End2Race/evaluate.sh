@@ -4,9 +4,9 @@
 MODEL_PATH="pretrained/end2race.pth"
 HIDDEN_SCALE=4
 NOISE=0.0
-NUM_WORKERS=4
-MAP_NAME="Austin"
-RENDER=true
+NUM_WORKERS=10
+MAP_NAME="Nuerburgring"
+RENDER=false
 SIM_DURATION=8.0
 EGO_RACELINE="raceline1"
 OPP_RACELINES=("raceline0" "raceline1" "raceline2")
